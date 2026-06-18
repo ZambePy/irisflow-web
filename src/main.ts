@@ -1,5 +1,6 @@
 import './style.css';
 import { FilesetResolver, FaceLandmarker } from '@mediapipe/tasks-vision';
+import * as calibration from './calibration';
 
 const video = document.getElementById('webcam') as HTMLVideoElement;
 const canvas = document.getElementById('output_canvas') as HTMLCanvasElement;
@@ -88,7 +89,12 @@ async function predictWebcam() {
       const landmarks = results.faceLandmarks[0];
       
       // Olho Direito do Usuário (Lado esquerdo da imagem)
-      const irisL = landmarks[468];
+      // Centro da íris calculado pela média do ponto central (468) e de contorno (469 a 472)
+      const irisL = {
+        x: (landmarks[468].x + landmarks[469].x + landmarks[470].x + landmarks[471].x + landmarks[472].x) / 5,
+        y: (landmarks[468].y + landmarks[469].y + landmarks[470].y + landmarks[471].y + landmarks[472].y) / 5,
+        z: (landmarks[468].z + landmarks[469].z + landmarks[470].z + landmarks[471].z + landmarks[472].z) / 5
+      };
       const eyeOuterL = landmarks[33];
       const eyeInnerL = landmarks[133];
       
@@ -101,7 +107,12 @@ async function predictWebcam() {
       const dyL = (irisL.y - stableCenterYL) / eyeWidthL;
 
       // Olho Esquerdo do Usuário (Lado direito da imagem)
-      const irisR = landmarks[473];
+      // Centro da íris calculado pela média do ponto central (473) e de contorno (474 a 477)
+      const irisR = {
+        x: (landmarks[473].x + landmarks[474].x + landmarks[475].x + landmarks[476].x + landmarks[477].x) / 5,
+        y: (landmarks[473].y + landmarks[474].y + landmarks[475].y + landmarks[476].y + landmarks[477].y) / 5,
+        z: (landmarks[473].z + landmarks[474].z + landmarks[475].z + landmarks[476].z + landmarks[477].z) / 5
+      };
       const eyeOuterR = landmarks[263];
       const eyeInnerR = landmarks[362];
       
@@ -130,13 +141,24 @@ async function predictWebcam() {
       minY = lerp(minY, DEFAULT_MIN_Y, CALIBRATION_DECAY);
       maxY = lerp(maxY, DEFAULT_MAX_Y, CALIBRATION_DECAY);
 
-      // Mapeamento dos limites dinâmicos para a resolução da tela
-      const mappedX = mapRange(ratioX, minX, maxX, 0, window.innerWidth);
-      const mappedY = mapRange(dy, minY, maxY, 0, window.innerHeight);
+      // Envia coordenadas cruas para o sistema de calibração (registra se estiver capturando)
+      calibration.feedRawData(ratioX, dy);
 
-      // Limitar aos limites da tela
-      targetX = clamp(mappedX, 0, window.innerWidth);
-      targetY = clamp(mappedY, 0, window.innerHeight);
+      // Tenta mapear o olhar usando o perfil calibrado
+      const calibratedGaze = calibration.mapGaze(ratioX, dy);
+
+      if (calibratedGaze) {
+        targetX = calibratedGaze.x;
+        targetY = calibratedGaze.y;
+      } else {
+        // Mapeamento dos limites dinâmicos (fallback) para a resolução da tela
+        const mappedX = mapRange(ratioX, minX, maxX, 0, window.innerWidth);
+        const mappedY = mapRange(dy, minY, maxY, 0, window.innerHeight);
+
+        // Limitar aos limites da tela
+        targetX = clamp(mappedX, 0, window.innerWidth);
+        targetY = clamp(mappedY, 0, window.innerHeight);
+      }
     }
   }
 
@@ -145,10 +167,19 @@ async function predictWebcam() {
   currentX = lerp(currentX, targetX, 0.05);
   currentY = lerp(currentY, targetY, 0.05);
   
-  laser.style.left = `${currentX}px`;
-  laser.style.top = `${currentY}px`;
+  // Ocultar laser durante calibração para evitar distração ocular do usuário
+  if (calibration.isCalibrating) {
+    laser.style.display = 'none';
+  } else {
+    laser.style.display = 'block';
+    laser.style.left = `${currentX}px`;
+    laser.style.top = `${currentY}px`;
+  }
 
   window.requestAnimationFrame(predictWebcam);
 }
+
+// Inicializa o painel de calibração e carrega perfis salvos
+calibration.init();
 
 initMediaPipe();
