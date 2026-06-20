@@ -18,10 +18,20 @@ const VALIDATION_POINTS = [
   { name: "Canto Inferior Dir",   screenX: 0.97, screenY: 0.97 },
 ];
 
-const COLLECTION_MS = 600;
+// Sacada ocular leva ~150-250ms para completar após o dot aparecer.
+// Incluir esses frames no cálculo do erro desloca a média para a posição anterior.
+// SETTLE_MS: janela descartada; MEASURE_MS: janela efetiva de coleta.
+const SETTLE_MS  = 350;
+const MEASURE_MS = 900;
 
 let rawFeedX = 0;
 let rawFeedY = 0;
+
+function median(arr: number[]): number {
+  const s = [...arr].sort((a, b) => a - b);
+  const m = Math.floor(s.length / 2);
+  return s.length % 2 === 0 ? (s[m - 1] + s[m]) / 2 : s[m];
+}
 
 // Recebe a posição crua do olhar a cada frame — chamado por main.ts
 export function feedAccuracyRaw(ratioX: number, dy: number) {
@@ -72,6 +82,12 @@ export function startAccuracyTest(onComplete: (result: AccuracyResult) => void) 
     function collect() {
       const elapsed = performance.now() - startTime;
 
+      // Fase de assentamento: descarta frames durante a sacada ocular (~150-250ms)
+      if (elapsed < SETTLE_MS) {
+        requestAnimationFrame(collect);
+        return;
+      }
+
       const diag = mapGazeDiag(rawFeedX, rawFeedY);
       if (diag) {
         predictedX.push(diag.x);
@@ -94,18 +110,19 @@ export function startAccuracyTest(onComplete: (result: AccuracyResult) => void) 
         );
       }
 
-      if (elapsed < COLLECTION_MS) {
+      if (elapsed < SETTLE_MS + MEASURE_MS) {
         requestAnimationFrame(collect);
         return;
       }
 
-      // Calcula erro Euclidiano médio para este ponto
+      // Usa mediana (não média) para robustez contra frames outlier durante a fixação.
+      // A mediana ignora piscar, micro-sacadas e frames com detecção ruidosa.
       let error = 0;
       if (predictedX.length > 0) {
-        const meanPX = predictedX.reduce((s, v) => s + v, 0) / predictedX.length;
-        const meanPY = predictedY.reduce((s, v) => s + v, 0) / predictedY.length;
-        const dx  = meanPX - targetScreenX;
-        const dy2 = meanPY - targetScreenY;
+        const medPX = median(predictedX);
+        const medPY = median(predictedY);
+        const dx  = medPX - targetScreenX;
+        const dy2 = medPY - targetScreenY;
         error = Math.sqrt(dx * dx + dy2 * dy2);
       }
 

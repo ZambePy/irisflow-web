@@ -81,6 +81,14 @@ let ridgeCoefY: number[] | null = null;
 let _trainMinRX = 0.35, _trainMaxRX = 0.65;
 let _trainMinDY = -0.07, _trainMaxDY  = 0.07;
 
+// Parâmetros de normalização das features (média e desvio padrão dos 16 pontos estáticos).
+// CRÍTICO: dy ≈ 0.03 e dy² ≈ 0.0009, enquanto ratioX² ≈ 0.25 — razão de escala de
+// ~277:1 entre colunas da matriz de design. Sem normalização, o coeficiente de dy²
+// fica numericamente instável mesmo com ridge leve, causando extrapolação catastrófica.
+// Com normalização, todas as features ficam com escala ~1, condicionando melhor o sistema.
+let _normMeanRX = 0.50, _normStdRX = 0.09;
+let _normMeanDY = 0.00, _normStdDY = 0.04;
+
 // Exporta os limites de treino para o módulo de acurácia.
 export function getTrainBounds() {
   return { minRX: _trainMinRX, maxRX: _trainMaxRX, minDY: _trainMinDY, maxDY: _trainMaxDY };
@@ -240,7 +248,25 @@ function selectLambda(
 export function retrainRidgeModel(extSamples: DynamicSample[] = []) {
   if (profile.length !== 16) { ridgeCoefX = null; ridgeCoefY = null; return; }
 
-  // Arrays de treino: estáticos primeiro, dinâmicos depois
+  // 1. Normalização: computa μ e σ a partir dos 16 pontos estáticos.
+  //    Usamos apenas o perfil (não os dinâmicos) para que a normalização seja
+  //    determinística e independente da sessão dinâmica.
+  _normMeanRX = profile.reduce((s, p) => s + p.rawX, 0) / 16;
+  _normMeanDY = profile.reduce((s, p) => s + p.rawY, 0) / 16;
+  const varRX  = profile.reduce((s, p) => s + (p.rawX - _normMeanRX) ** 2, 0) / 16;
+  const varDY  = profile.reduce((s, p) => s + (p.rawY - _normMeanDY) ** 2, 0) / 16;
+  _normStdRX   = Math.max(Math.sqrt(varRX), 0.005); // mínimo de 0.005 para evitar divisão por zero
+  _normStdDY   = Math.max(Math.sqrt(varDY), 0.003);
+
+  // Salva envelope (não-normalizado) para diagnóstico de extrapolação
+  _trainMinRX = Math.min(...profile.map(p => p.rawX));
+  _trainMaxRX = Math.max(...profile.map(p => p.rawX));
+  _trainMinDY = Math.min(...profile.map(p => p.rawY));
+  _trainMaxDY = Math.max(...profile.map(p => p.rawY));
+
+  // 2. Monta arrays de treino com features já normalizadas.
+  //    A mesma normalização é aplicada em inferência (mapGazeDiag), garantindo
+  //    que treino e inferência operem no mesmo espaço de features.
   const rs:  number[] = [];
   const ds:  number[] = [];
   const tgX: number[] = [];
@@ -248,33 +274,29 @@ export function retrainRidgeModel(extSamples: DynamicSample[] = []) {
   const ws:  number[] = [];
 
   for (const pt of profile) {
-    rs.push(pt.rawX); ds.push(pt.rawY);
+    rs.push((pt.rawX - _normMeanRX) / _normStdRX);
+    ds.push((pt.rawY - _normMeanDY) / _normStdDY);
     tgX.push(pt.screenX); tgY.push(pt.screenY);
     ws.push(W_STATIC);
   }
   for (const s of extSamples) {
-    rs.push(s.rawX); ds.push(s.rawY);
+    rs.push((s.rawX - _normMeanRX) / _normStdRX);
+    ds.push((s.rawY - _normMeanDY) / _normStdDY);
     tgX.push(s.screenX); tgY.push(s.screenY);
     ws.push(s.weight);
   }
 
-  // Seleciona lambda via LOOCV nos 16 pontos estáticos (proxy de generalização)
-  const staticRs  = profile.map(p => p.rawX);
-  const staticDs  = profile.map(p => p.rawY);
-  const staticTgX = profile.map(p => p.screenX);
-  const staticTgY = profile.map(p => p.screenY);
-  const { lambda, report } = selectLambda(staticRs, staticDs, staticTgX, staticTgY);
+  // 3. LOOCV nos 16 pontos estáticos normalizados para selecionar lambda
+  const staticRsN  = profile.map(p => (p.rawX - _normMeanRX) / _normStdRX);
+  const staticDsN  = profile.map(p => (p.rawY - _normMeanDY) / _normStdDY);
+  const staticTgX  = profile.map(p => p.screenX);
+  const staticTgY  = profile.map(p => p.screenY);
+  const { lambda, report } = selectLambda(staticRsN, staticDsN, staticTgX, staticTgY);
 
-  // Fit final com todos os dados disponíveis (estáticos + dinâmicos)
+  // 4. Fit final com todos os dados normalizados
   const { coefX, coefY } = fitRidgeWeighted(rs, ds, tgX, tgY, ws, lambda);
   ridgeCoefX = coefX;
   ridgeCoefY = coefY;
-
-  // Atualiza o envelope do espaço bruto — usado para detecção de extrapolação
-  _trainMinRX = Math.min(...profile.map(p => p.rawX));
-  _trainMaxRX = Math.max(...profile.map(p => p.rawX));
-  _trainMinDY = Math.min(...profile.map(p => p.rawY));
-  _trainMaxDY = Math.max(...profile.map(p => p.rawY));
 
   logRidgeReport(lambda, report, extSamples.length);
   logTrainDiagnostics();
@@ -319,13 +341,20 @@ function logTrainDiagnostics() {
     `Envelope rawX: [${_trainMinRX.toFixed(4)}, ${_trainMaxRX.toFixed(4)}]  ` +
     `dy: [${_trainMinDY.toFixed(4)}, ${_trainMaxDY.toFixed(4)}]`
   );
-  console.log('Resíduos nos 16 pontos (screenX/Y previstos vs reais):');
+  console.log(
+    `Normalização: μ_rx=${_normMeanRX.toFixed(4)} σ_rx=${_normStdRX.toFixed(4)}  ` +
+    `μ_dy=${_normMeanDY.toFixed(4)} σ_dy=${_normStdDY.toFixed(4)}`
+  );
+  console.log('Resíduos nos 16 pontos (features normalizadas — como no treino):');
 
   let maxErrPx = 0;
   for (const pt of profile) {
-    const f     = buildFeatures(pt.rawX, pt.rawY);
-    const pNX   = ridgeCoefX.reduce((s, c, i) => s + c * f[i], 0);
-    const pNY   = ridgeCoefY.reduce((s, c, i) => s + c * f[i], 0);
+    // Usa as mesmas features normalizadas que foram usadas no treino
+    const rn    = (pt.rawX - _normMeanRX) / _normStdRX;
+    const dn    = (pt.rawY - _normMeanDY) / _normStdDY;
+    const f     = buildFeatures(rn, dn);
+    const pNX   = ridgeCoefX!.reduce((s, c, i) => s + c * f[i], 0);
+    const pNY   = ridgeCoefY!.reduce((s, c, i) => s + c * f[i], 0);
     const eX    = Math.round((pNX - pt.screenX) * W);
     const eY    = Math.round((pNY - pt.screenY) * H);
     const ePx   = Math.round(Math.sqrt(eX ** 2 + eY ** 2));
@@ -335,15 +364,12 @@ function logTrainDiagnostics() {
     console.log(
       `  tela(${pt.screenX.toFixed(2)},${pt.screenY.toFixed(2)}) ` +
       `raw(${pt.rawX.toFixed(4)},${pt.rawY.toFixed(4)}) ` +
+      `norm(${rn.toFixed(2)},${dn.toFixed(2)}) ` +
       `→ pred(${pNX.toFixed(3)},${pNY.toFixed(3)}) ` +
       `err(${eX}px,${eY}px)=${ePx}px${outX}${outY}`
     );
   }
   console.log(`Resíduo máximo no treino: ${maxErrPx}px`);
-  console.log(
-    'Se o teste de validação der erros muito maiores que este valor, ' +
-    'o input rawX/dy está fora do envelope de treino (extrapolação polinomial).'
-  );
   console.groupEnd();
 }
 
@@ -813,16 +839,28 @@ export interface GazeDiag {
 export function mapGazeDiag(ratioX: number, dy: number): GazeDiag | null {
   if (!ridgeCoefX || !ridgeCoefY) return null;
 
-  const f    = buildFeatures(ratioX, dy);
+  // Normaliza a entrada com os mesmos parâmetros usados no treino.
+  // Sem normalização, dy² ≈ 0.0009 vs ratioX² ≈ 0.25 (razão 277:1) causa
+  // coeficientes instáveis que divergem fora do range de treino.
+  const rn = (ratioX - _normMeanRX) / _normStdRX;
+  const dn = (dy     - _normMeanDY) / _normStdDY;
+
+  // Clamp de ENTRADA a ±2.5 σ: impede que o polinômio grau-2 extrapole
+  // catastroficamente por movimento de cabeça ou pisca entre calibração e teste.
+  // (com lambda≈0.0001, um coef ruim de dy² amplificado ×(dy/sigma)² → centenas de px)
+  const CLAMP_STD = 2.5;
+  const rc = Math.max(Math.min(rn, CLAMP_STD), -CLAMP_STD);
+  const dc = Math.max(Math.min(dn, CLAMP_STD), -CLAMP_STD);
+  const inputWasClamped = rc !== rn || dc !== dn;
+
+  const f     = buildFeatures(rc, dc);
   const rawNX = ridgeCoefX.reduce((s, c, i) => s + c * f[i], 0);
   const rawNY = ridgeCoefY.reduce((s, c, i) => s + c * f[i], 0);
-  const normX = Math.min(Math.max(rawNX, 0), 1); // clamp de SAÍDA — confirma (1)
+  const normX = Math.min(Math.max(rawNX, 0), 1); // clamp de SAÍDA
   const normY = Math.min(Math.max(rawNY, 0), 1);
 
-  const margin = 0.05; // 5% extra para não alertar por ruído na fronteira
-  const outOfBounds =
-    ratioX < _trainMinRX - margin || ratioX > _trainMaxRX + margin ||
-    dy     < _trainMinDY - margin || dy     > _trainMaxDY + margin;
+  // outOfBounds: mais de 1.5σ além dos dados de treino (em espaço normalizado)
+  const outOfBounds = Math.abs(rn) > 1.5 || Math.abs(dn) > 1.5 || inputWasClamped;
 
   return {
     x: normX * window.innerWidth,
