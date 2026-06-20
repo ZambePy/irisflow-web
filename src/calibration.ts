@@ -32,8 +32,6 @@ const TARGET_POINTS = [
   { name: "Canto Inferior Direito",   screenX: 0.97, screenY: 0.97 },
 ];
 
-const GRID_NORM = [0.0, 0.333, 0.667, 1.0];
-
 const COLLECTION_MS        = 1000;
 const TRANSITION_MS        = 1000;
 const DYN_MOVE_MS          = 1200;
@@ -55,6 +53,10 @@ const DYNAMIC_WAYPOINTS = [
   { x: 0.95, y: 0.95 },
 ];
 
+// Peso relativo de cada ponto estático vs. uma amostra dinâmica individual.
+// Cada ponto estático representa ~30 frames de fixação cuidadosa — vale muito mais.
+const W_STATIC = 30;
+
 let profile: CalibrationPoint[] = [];
 export let isCalibrating = false;
 let isDynamicCalibrating = false;
@@ -70,12 +72,234 @@ let dynamicBallX = 0.5;
 let dynamicBallY = 0.5;
 let dynamicIsFixation = false;
 
+// Coeficientes do modelo ridge pré-computados (recalculados após calibrar/carregar)
+let ridgeCoefX: number[] | null = null;
+let ridgeCoefY: number[] | null = null;
+
+// ── Ridge Regression ─────────────────────────────────────────────────────────
+
+// Base polinomial grau 2 em 2D: [1, r, d, r², r·d, d²]
+// Captura distorção linear, curvatura e interação entre eixos — tudo relevante
+// em eye tracking via webcam onde a relação iris→tela não é linear.
+function buildFeatures(r: number, d: number): number[] {
+  return [1, r, d, r * r, r * d, d * d];
+}
+
+// Eliminação gaussiana com pivotamento parcial — resolve Ax = b.
+// 6×6 é trivial; cópias internas evitam mutar os argumentos.
+function solveLinear(A_in: number[][], b_in: number[]): number[] {
+  const n = A_in.length;
+  const A = A_in.map(row => [...row]);
+  const b = [...b_in];
+
+  for (let col = 0; col < n; col++) {
+    let maxRow = col;
+    for (let row = col + 1; row < n; row++) {
+      if (Math.abs(A[row][col]) > Math.abs(A[maxRow][col])) maxRow = row;
+    }
+    [A[col], A[maxRow]] = [A[maxRow], A[col]];
+    [b[col], b[maxRow]] = [b[maxRow], b[col]];
+
+    const pivot = A[col][col];
+    if (Math.abs(pivot) < 1e-14) continue;
+
+    for (let row = 0; row < n; row++) {
+      if (row === col) continue;
+      const f = A[row][col] / pivot;
+      for (let j = col; j < n; j++) A[row][j] -= f * A[col][j];
+      b[row] -= f * b[col];
+    }
+  }
+  return b.map((v, i) => (Math.abs(A[i][i]) < 1e-14 ? 0 : v / A[i][i]));
+}
+
+// Ridge regression ponderada: w = (XᵀWX + λI)⁻¹ XᵀW y
+// Não regulariza o intercepto (índice 0) para preservar a escala global.
+function fitRidgeWeighted(
+  rs: number[], ds: number[],
+  tgX: number[], tgY: number[],
+  ws: number[],
+  lambda: number
+): { coefX: number[]; coefY: number[] } {
+  const n  = rs.length;
+  const nf = 6;
+  const X  = rs.map((r, i) => buildFeatures(r, ds[i]));
+
+  const XtWX  = Array.from({ length: nf }, () => new Array(nf).fill(0));
+  const XtWYx = new Array(nf).fill(0);
+  const XtWYy = new Array(nf).fill(0);
+
+  for (let i = 0; i < n; i++) {
+    const w = ws[i];
+    for (let j = 0; j < nf; j++) {
+      XtWYx[j] += w * X[i][j] * tgX[i];
+      XtWYy[j] += w * X[i][j] * tgY[i];
+      for (let k = 0; k < nf; k++) XtWX[j][k] += w * X[i][j] * X[i][k];
+    }
+  }
+  for (let j = 1; j < nf; j++) XtWX[j][j] += lambda;
+
+  return {
+    coefX: solveLinear(XtWX, XtWYx),
+    coefY: solveLinear(XtWX.map(r => [...r]), XtWYy),
+  };
+}
+
+// LOOCV shortcut para ridge ponderada.
+// Fórmula: e_LOO_i = (yᵢ − ŷᵢ) / (1 − Hᵢᵢ)
+// onde Hᵢᵢ = wᵢ · xᵢᵀ (XᵀWX + λI)⁻¹ xᵢ
+// Evita re-treinar o modelo N vezes — O(nf³) por lambda candidato.
+function loocvPixelError(
+  rs: number[], ds: number[],
+  tgX: number[], tgY: number[],
+  ws: number[],
+  lambda: number
+): number {
+  const n  = rs.length;
+  const nf = 6;
+  const X  = rs.map((r, i) => buildFeatures(r, ds[i]));
+
+  // Monta XᵀWX + λI
+  const XtWX = Array.from({ length: nf }, () => new Array(nf).fill(0));
+  for (let i = 0; i < n; i++) {
+    const w = ws[i];
+    for (let j = 0; j < nf; j++)
+      for (let k = 0; k < nf; k++) XtWX[j][k] += w * X[i][j] * X[i][k];
+  }
+  for (let j = 1; j < nf; j++) XtWX[j][j] += lambda;
+
+  // Inverte (XᵀWX + λI) coluna por coluna: inv[c][r] = A⁻¹[r][c]
+  const inv = Array.from({ length: nf }, (_, c) => {
+    const e = new Array(nf).fill(0); e[c] = 1;
+    return solveLinear(XtWX.map(row => [...row]), e);
+  });
+
+  const { coefX, coefY } = fitRidgeWeighted(rs, ds, tgX, tgY, ws, lambda);
+
+  const W = window?.innerWidth  ?? 1920;
+  const H = window?.innerHeight ?? 1080;
+
+  let totalErr = 0;
+  for (let i = 0; i < n; i++) {
+    const xi = X[i];
+
+    // Hᵢᵢ = wᵢ · xᵢᵀ A⁻¹ xᵢ
+    let hii = 0;
+    for (let j = 0; j < nf; j++) {
+      let axj = 0;
+      for (let k = 0; k < nf; k++) axj += inv[k][j] * xi[k]; // (A⁻¹ xᵢ)[j]
+      hii += xi[j] * axj;
+    }
+    hii = Math.min(ws[i] * hii, 0.9999);
+
+    const predX = coefX.reduce((s, c, j) => s + c * xi[j], 0);
+    const predY = coefY.reduce((s, c, j) => s + c * xi[j], 0);
+    const cvX   = (tgX[i] - predX) / (1 - hii);
+    const cvY   = (tgY[i] - predY) / (1 - hii);
+
+    // Converte para pixels antes de acumular — métrica interpretável
+    totalErr += Math.sqrt((cvX * W) ** 2 + (cvY * H) ** 2);
+  }
+  return totalErr / n; // erro médio euclidiano LOOCV em pixels
+}
+
+// Grid search sobre candidatos de lambda; usa apenas os 16 pontos estáticos
+// com pesos iguais para isolar a capacidade de generalização do modelo.
+function selectLambda(
+  rs: number[], ds: number[],
+  tgX: number[], tgY: number[]
+): { lambda: number; report: [number, number][] } {
+  const candidates = [0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0];
+  const ws = rs.map(() => 1); // pesos iguais para LOOCV — avalia só generalização
+
+  let bestLambda = candidates[0];
+  let bestErr    = Infinity;
+  const report: [number, number][] = [];
+
+  for (const lambda of candidates) {
+    const err = loocvPixelError(rs, ds, tgX, tgY, ws, lambda);
+    report.push([lambda, err]);
+    if (err < bestErr) { bestErr = err; bestLambda = lambda; }
+  }
+  return { lambda: bestLambda, report };
+}
+
+// Treina (ou re-treina) o modelo ridge com os pontos estáticos do profile
+// e, opcionalmente, as amostras dinâmicas coletadas na Fase 2.
+// Chamada automaticamente ao carregar/salvar o perfil.
+export function retrainRidgeModel(extSamples: DynamicSample[] = []) {
+  if (profile.length !== 16) { ridgeCoefX = null; ridgeCoefY = null; return; }
+
+  // Arrays de treino: estáticos primeiro, dinâmicos depois
+  const rs:  number[] = [];
+  const ds:  number[] = [];
+  const tgX: number[] = [];
+  const tgY: number[] = [];
+  const ws:  number[] = [];
+
+  for (const pt of profile) {
+    rs.push(pt.rawX); ds.push(pt.rawY);
+    tgX.push(pt.screenX); tgY.push(pt.screenY);
+    ws.push(W_STATIC);
+  }
+  for (const s of extSamples) {
+    rs.push(s.rawX); ds.push(s.rawY);
+    tgX.push(s.screenX); tgY.push(s.screenY);
+    ws.push(s.weight);
+  }
+
+  // Seleciona lambda via LOOCV nos 16 pontos estáticos (proxy de generalização)
+  const staticRs  = profile.map(p => p.rawX);
+  const staticDs  = profile.map(p => p.rawY);
+  const staticTgX = profile.map(p => p.screenX);
+  const staticTgY = profile.map(p => p.screenY);
+  const { lambda, report } = selectLambda(staticRs, staticDs, staticTgX, staticTgY);
+
+  // Fit final com todos os dados disponíveis (estáticos + dinâmicos)
+  const { coefX, coefY } = fitRidgeWeighted(rs, ds, tgX, tgY, ws, lambda);
+  ridgeCoefX = coefX;
+  ridgeCoefY = coefY;
+
+  logRidgeReport(lambda, report, extSamples.length);
+}
+
+function logRidgeReport(
+  lambda: number,
+  report: [number, number][],
+  nDynamic: number
+) {
+  const selected = report.find(([l]) => l === lambda);
+  const olsEntry = report.find(([l]) => l === 0.0001); // proxy para OLS (sem reg.)
+
+  console.group('[IrisFlow] Ridge Regression — Relatório de Calibração');
+  console.log(`Pontos estáticos: 16 | Amostras dinâmicas: ${nDynamic} | λ selecionado: ${lambda}`);
+  console.log(`LOOCV médio (px) — ridge (λ=${lambda}): ${selected?.[1].toFixed(1)}px`);
+  if (olsEntry) {
+    console.log(`LOOCV médio (px) — OLS referência (λ→0): ${olsEntry[1].toFixed(1)}px`);
+    const gain = olsEntry[1] - (selected?.[1] ?? 0);
+    console.log(`Ganho da regularização: ${gain.toFixed(1)}px de redução no LOOCV`);
+  }
+  console.log('Curva LOOCV por λ:');
+  for (const [l, e] of report) {
+    const marker = l === lambda ? ' ← selecionado' : '';
+    console.log(`  λ=${l}: ${e.toFixed(1)}px${marker}`);
+  }
+  console.log('Bilinear: resíduo 0 no treino por construção — LOOCV real indisponível');
+  console.log('Referência: o teste de precisão pós-calibração mede o erro nos 5 pontos de validação.');
+  console.groupEnd();
+}
+
+// ── Perfil e Estado ───────────────────────────────────────────────────────────
+
 export function loadProfile(): boolean {
   try {
     const saved = localStorage.getItem("calibrationProfile");
     if (saved) {
       profile = JSON.parse(saved);
-      if (profile.length === 16) return true;
+      if (profile.length === 16) {
+        retrainRidgeModel([]); // re-constrói coeficientes a partir do perfil salvo
+        return true;
+      }
     }
   } catch (e) {
     console.error("Erro ao carregar calibrationProfile:", e);
@@ -85,19 +309,25 @@ export function loadProfile(): boolean {
 }
 
 function saveProfile() {
+  // Salva apenas os 16 pontos estáticos brutos — os coeficientes ridge são
+  // recalculados em tempo de execução, então não precisam ser persistidos.
   localStorage.setItem("calibrationProfile", JSON.stringify(profile));
 }
 
 export function clearCalibration() {
   profile = [];
+  ridgeCoefX = null;
+  ridgeCoefY = null;
   localStorage.removeItem("calibrationProfile");
   localStorage.removeItem("accuracyResult");
   updateStatusUI();
 }
 
 export function isCalibrated(): boolean {
-  return profile.length === 16;
+  return profile.length === 16 && ridgeCoefX !== null;
 }
+
+// ── Fluxo de Calibração ───────────────────────────────────────────────────────
 
 export function startCalibrationMode() {
   if (isCalibrating) return;
@@ -106,6 +336,8 @@ export function startCalibrationMode() {
   isCollecting = false;
   unstableRetries = 0;
   profile = [];
+  ridgeCoefX = null;
+  ridgeCoefY = null;
 
   createCalibrationOverlay();
   showNextPoint();
@@ -330,7 +562,6 @@ function startDynamicCalibration() {
     `;
   }
 
-  // Indicador de progresso
   const progressEl = document.createElement("div");
   progressEl.id = "dynamic-progress";
   progressEl.className = "dynamic-progress";
@@ -342,7 +573,6 @@ function startDynamicCalibration() {
   });
   overlay.appendChild(progressEl);
 
-  // Bolinha no primeiro waypoint
   const ball = document.createElement("div");
   ball.id = "dynamic-ball";
   ball.className = "dynamic-ball";
@@ -424,39 +654,23 @@ function pulseBall(ball: HTMLElement, onComplete: () => void) {
 
 function completeDynamicCalibration() {
   isDynamicCalibrating = false;
-  if (dynamicSamples.length >= 20) refineDynamicProfile();
+
+  // Inclui APENAS samples de fixação (w>1.5) com peso reduzido para 0.5.
+  // Samples de movimento (w=1.0) são excluídos porque:
+  //   • Introduzem viés de lag de perseguição (~55px em X, ~20px em Y com lag=200ms)
+  //   • O snake path tem assimetria estrutural: 4 segmentos rightward vs 2 leftward
+  //     e 2 downward sem nenhum upward — viés em Y não se cancela
+  // Mesmo os samples de fixação têm ruído 5× maior que os pontos estáticos (SEM);
+  // o peso 0.5 mantém sua contribuição ≤4% do peso total, evitando diluição do fit.
+  const fixationOnly = dynamicSamples
+    .filter(s => s.weight > 1.5)
+    .map(s => ({ ...s, weight: 0.5 }));
+  retrainRidgeModel(fixationOnly);
   saveProfile();
   cleanupOverlay();
   isCalibrating = false;
   window.removeEventListener("keydown", handleGlobalKeyDown);
   runAccuracyTest();
-}
-
-function refineDynamicProfile() {
-  const SIGMA    = 0.15;
-  const MAX_DIST = 0.35;
-
-  for (const pt of profile) {
-    let totalW = 0, sumX = 0, sumY = 0;
-
-    for (const s of dynamicSamples) {
-      const dx   = s.screenX - pt.screenX;
-      const dy   = s.screenY - pt.screenY;
-      const dist = Math.sqrt(dx * dx + dy * dy);
-      if (dist > MAX_DIST) continue;
-      const w = Math.exp(-(dist * dist) / (2 * SIGMA * SIGMA)) * s.weight;
-      totalW += w;
-      sumX   += s.rawX * w;
-      sumY   += s.rawY * w;
-    }
-
-    if (totalW > 5) {
-      // Influência dinâmica conservadora: máximo 30% de ajuste
-      const alpha = Math.min((totalW - 5) / 200, 0.30);
-      pt.rawX = pt.rawX * (1 - alpha) + (sumX / totalW) * alpha;
-      pt.rawY = pt.rawY * (1 - alpha) + (sumY / totalW) * alpha;
-    }
-  }
 }
 
 // ── Painel de Controle ───────────────────────────────────────────────────────
@@ -527,62 +741,25 @@ export function init() {
   } catch (_) {}
 }
 
-// ── Mapeamento de Olhar (bilinear 4×4) ───────────────────────────────────────
+// ── Mapeamento de Olhar (Ridge Regression) ───────────────────────────────────
 
+// Substitui a interpolação bilinear por regressão ridge com base polinomial grau 2.
+// Vantagens sobre a bilinear:
+//   • Regularização L2 amortece o ruído de qualquer ponto de calibração individual,
+//     em vez de "gravar" o erro na malha permanentemente.
+//   • Função suave (C∞) — sem descontinuidades de gradiente nas bordas de células,
+//     eliminando o "salto" do cursor ao cruzar fronteiras de grade.
+//   • Incorpora amostras dinâmicas com pesos no ajuste global, não só nos 16 vértices.
+//   • Lambda selecionado por LOOCV shortcut — adaptativo à qualidade da calibração.
 export function mapGaze(ratioX: number, dy: number): { x: number; y: number } | null {
-  if (profile.length !== 16) return null;
+  if (!ridgeCoefX || !ridgeCoefY) return null;
 
-  const lerpVal     = (a: number, b: number, t: number) => a + (b - a) * t;
-  const clampVal    = (v: number, lo: number, hi: number) => Math.min(Math.max(v, lo), hi);
-  const mapRangeVal = (v: number, iMin: number, iMax: number, oMin: number, oMax: number) => {
-    if (Math.abs(iMax - iMin) < 1e-6) return oMin;
-    return (v - iMin) * (oMax - oMin) / (iMax - iMin) + oMin;
-  };
-
-  const pt = profile;
-
-  function getColRawX(col: number, y: number): number {
-    const rows = [pt[col], pt[col + 4], pt[col + 8], pt[col + 12]];
-    for (let i = 0; i < 3; i++) {
-      const a = rows[i], b = rows[i + 1];
-      if (y <= Math.max(a.rawY, b.rawY) || i === 2) {
-        if (Math.abs(a.rawY - b.rawY) < 1e-6) return a.rawX;
-        return lerpVal(a.rawX, b.rawX, clampVal((y - a.rawY) / (b.rawY - a.rawY), 0, 1));
-      }
-    }
-    return rows[0].rawX;
-  }
-
-  function getRowRawY(row: number, x: number): number {
-    const cols = [pt[row * 4], pt[row * 4 + 1], pt[row * 4 + 2], pt[row * 4 + 3]];
-    for (let i = 0; i < 3; i++) {
-      const a = cols[i], b = cols[i + 1];
-      if (x <= Math.max(a.rawX, b.rawX) || i === 2) {
-        if (Math.abs(a.rawX - b.rawX) < 1e-6) return a.rawY;
-        return lerpVal(a.rawY, b.rawY, clampVal((x - a.rawX) / (b.rawX - a.rawX), 0, 1));
-      }
-    }
-    return cols[0].rawY;
-  }
-
-  const c0 = getColRawX(0, dy), c1 = getColRawX(1, dy);
-  const c2 = getColRawX(2, dy), c3 = getColRawX(3, dy);
-
-  let normX: number;
-  if      (ratioX <= c1) normX = mapRangeVal(ratioX, c0, c1, GRID_NORM[0], GRID_NORM[1]);
-  else if (ratioX <= c2) normX = mapRangeVal(ratioX, c1, c2, GRID_NORM[1], GRID_NORM[2]);
-  else                   normX = mapRangeVal(ratioX, c2, c3, GRID_NORM[2], GRID_NORM[3]);
-
-  const r0 = getRowRawY(0, ratioX), r1 = getRowRawY(1, ratioX);
-  const r2 = getRowRawY(2, ratioX), r3 = getRowRawY(3, ratioX);
-
-  let normY: number;
-  if      (dy <= r1) normY = mapRangeVal(dy, r0, r1, GRID_NORM[0], GRID_NORM[1]);
-  else if (dy <= r2) normY = mapRangeVal(dy, r1, r2, GRID_NORM[1], GRID_NORM[2]);
-  else               normY = mapRangeVal(dy, r2, r3, GRID_NORM[2], GRID_NORM[3]);
+  const f    = buildFeatures(ratioX, dy);
+  const normX = Math.min(Math.max(ridgeCoefX.reduce((s, c, i) => s + c * f[i], 0), 0), 1);
+  const normY = Math.min(Math.max(ridgeCoefY.reduce((s, c, i) => s + c * f[i], 0), 0), 1);
 
   return {
-    x: clampVal(normX, 0, 1) * window.innerWidth,
-    y: clampVal(normY, 0, 1) * window.innerHeight
+    x: normX * window.innerWidth,
+    y: normY * window.innerHeight,
   };
 }
