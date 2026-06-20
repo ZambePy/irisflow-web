@@ -13,11 +13,16 @@ interface DynamicSample {
   weight: number;
 }
 
+// Linha superior em 0.08 (não 0.03): gaze extremamente para cima oclude parcialmente
+// a íris na pálpebra superior, degradando a detecção MediaPipe. A 0.08 o ângulo é
+// confortável, a íris fica totalmente visível e os dados de calibração são confiáveis.
+// O modelo extrapola controladamente de 0.08 → 0.03 em vez de ser treinado com dado ruim.
+// Mesma lógica na linha inferior: 0.92 em vez de 0.97.
 const TARGET_POINTS = [
-  { name: "Canto Superior Esquerdo",  screenX: 0.03, screenY: 0.03 },
-  { name: "Superior Centro-Esquerdo", screenX: 0.35, screenY: 0.03 },
-  { name: "Superior Centro-Direito",  screenX: 0.65, screenY: 0.03 },
-  { name: "Canto Superior Direito",   screenX: 0.97, screenY: 0.03 },
+  { name: "Canto Superior Esquerdo",  screenX: 0.03, screenY: 0.08 },
+  { name: "Superior Centro-Esquerdo", screenX: 0.35, screenY: 0.08 },
+  { name: "Superior Centro-Direito",  screenX: 0.65, screenY: 0.08 },
+  { name: "Canto Superior Direito",   screenX: 0.97, screenY: 0.08 },
   { name: "Médio-Alto Esquerdo",      screenX: 0.03, screenY: 0.35 },
   { name: "Médio-Alto Centro-Esq",    screenX: 0.35, screenY: 0.35 },
   { name: "Médio-Alto Centro-Dir",    screenX: 0.65, screenY: 0.35 },
@@ -26,10 +31,10 @@ const TARGET_POINTS = [
   { name: "Médio-Baixo Centro-Esq",   screenX: 0.35, screenY: 0.65 },
   { name: "Médio-Baixo Centro-Dir",   screenX: 0.65, screenY: 0.65 },
   { name: "Médio-Baixo Direito",      screenX: 0.97, screenY: 0.65 },
-  { name: "Canto Inferior Esquerdo",  screenX: 0.03, screenY: 0.97 },
-  { name: "Inferior Centro-Esquerdo", screenX: 0.35, screenY: 0.97 },
-  { name: "Inferior Centro-Direito",  screenX: 0.65, screenY: 0.97 },
-  { name: "Canto Inferior Direito",   screenX: 0.97, screenY: 0.97 },
+  { name: "Canto Inferior Esquerdo",  screenX: 0.03, screenY: 0.92 },
+  { name: "Inferior Centro-Esquerdo", screenX: 0.35, screenY: 0.92 },
+  { name: "Inferior Centro-Direito",  screenX: 0.65, screenY: 0.92 },
+  { name: "Canto Inferior Direito",   screenX: 0.97, screenY: 0.92 },
 ];
 
 const COLLECTION_MS        = 1000;
@@ -40,17 +45,18 @@ const STD_THRESHOLD_X      = 0.015;
 const STD_THRESHOLD_Y      = 0.010;
 const MAX_UNSTABLE_RETRIES = 2;
 
-// Snake path 3×3 cobrindo toda a tela
+// Snake path 3×3 alinhado com a grade de calibração estática.
+// Linha superior em y=0.08 e inferior em y=0.92 pelo mesmo motivo dos TARGET_POINTS.
 const DYNAMIC_WAYPOINTS = [
-  { x: 0.05, y: 0.05 },
-  { x: 0.50, y: 0.05 },
-  { x: 0.95, y: 0.05 },
+  { x: 0.05, y: 0.08 },
+  { x: 0.50, y: 0.08 },
+  { x: 0.95, y: 0.08 },
   { x: 0.95, y: 0.50 },
   { x: 0.50, y: 0.50 },
   { x: 0.05, y: 0.50 },
-  { x: 0.05, y: 0.95 },
-  { x: 0.50, y: 0.95 },
-  { x: 0.95, y: 0.95 },
+  { x: 0.05, y: 0.92 },
+  { x: 0.50, y: 0.92 },
+  { x: 0.95, y: 0.92 },
 ];
 
 // Peso relativo de cada ponto estático vs. uma amostra dinâmica individual.
@@ -526,6 +532,12 @@ function stdDev(values: number[]): number {
   return Math.sqrt(values.reduce((s, v) => s + (v - mean) ** 2, 0) / values.length);
 }
 
+function medianOf(values: number[]): number {
+  const s = [...values].sort((a, b) => a - b);
+  const m = Math.floor(s.length / 2);
+  return s.length % 2 === 0 ? (s[m - 1] + s[m]) / 2 : s[m];
+}
+
 export function feedRawData(ratioX: number, dy: number) {
   if (isDynamicCalibrating) {
     dynamicSamples.push({
@@ -550,9 +562,28 @@ export function feedRawData(ratioX: number, dy: number) {
 }
 
 function processStaticPoint() {
+  // Remove frames onde o olho ainda estava em movimento (sacada dentro da janela de coleta).
+  // Threshold de velocidade: >0.004 por frame (~0.12/s a 30fps) = olho em deslocamento.
+  // Mínimo de 8 frames estáveis para aceitar — garante representatividade mesmo com filtragem.
+  const VELOCITY_THRESH = 0.004;
+  const stableX: number[] = [];
+  const stableY: number[] = [];
+  for (let i = 0; i < collectedRawX.length; i++) {
+    if (i === 0) continue; // primeiro frame sem delta
+    const vx = Math.abs(collectedRawX[i] - collectedRawX[i - 1]);
+    const vy = Math.abs(collectedRawY[i] - collectedRawY[i - 1]);
+    if (vx < VELOCITY_THRESH && vy < VELOCITY_THRESH) {
+      stableX.push(collectedRawX[i]);
+      stableY.push(collectedRawY[i]);
+    }
+  }
+  // Fallback para os dados brutos se o filtro removeu demais (ex: tremor constante)
+  const filtX = stableX.length >= 8 ? stableX : collectedRawX;
+  const filtY = stableY.length >= 8 ? stableY : collectedRawY;
+
   const isUnstable =
-    stdDev(collectedRawX) > STD_THRESHOLD_X ||
-    stdDev(collectedRawY) > STD_THRESHOLD_Y;
+    stdDev(filtX) > STD_THRESHOLD_X ||
+    stdDev(filtY) > STD_THRESHOLD_Y;
 
   if (isUnstable && unstableRetries < MAX_UNSTABLE_RETRIES) {
     unstableRetries++;
@@ -562,8 +593,9 @@ function processStaticPoint() {
 
   unstableRetries = 0;
 
-  const avgX = collectedRawX.reduce((s, v) => s + v, 0) / collectedRawX.length;
-  const avgY = collectedRawY.reduce((s, v) => s + v, 0) / collectedRawY.length;
+  // Mediana em vez de média: robusta a piscar, micro-sacadas e outliers isolados
+  const avgX = medianOf(filtX);
+  const avgY = medianOf(filtY);
 
   profile.push({
     screenX: TARGET_POINTS[currentPointIndex].screenX,
