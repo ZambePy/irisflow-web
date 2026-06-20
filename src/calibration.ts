@@ -76,6 +76,16 @@ let dynamicIsFixation = false;
 let ridgeCoefX: number[] | null = null;
 let ridgeCoefY: number[] | null = null;
 
+// Envelope (bounding box) dos dados de treino em espaço bruto.
+// Usado para detectar extrapolação e para clampar a entrada do modelo.
+let _trainMinRX = 0.35, _trainMaxRX = 0.65;
+let _trainMinDY = -0.07, _trainMaxDY  = 0.07;
+
+// Exporta os limites de treino para o módulo de acurácia.
+export function getTrainBounds() {
+  return { minRX: _trainMinRX, maxRX: _trainMaxRX, minDY: _trainMinDY, maxDY: _trainMaxDY };
+}
+
 // ── Ridge Regression ─────────────────────────────────────────────────────────
 
 // Base polinomial grau 2 em 2D: [1, r, d, r², r·d, d²]
@@ -260,7 +270,14 @@ export function retrainRidgeModel(extSamples: DynamicSample[] = []) {
   ridgeCoefX = coefX;
   ridgeCoefY = coefY;
 
+  // Atualiza o envelope do espaço bruto — usado para detecção de extrapolação
+  _trainMinRX = Math.min(...profile.map(p => p.rawX));
+  _trainMaxRX = Math.max(...profile.map(p => p.rawX));
+  _trainMinDY = Math.min(...profile.map(p => p.rawY));
+  _trainMaxDY = Math.max(...profile.map(p => p.rawY));
+
   logRidgeReport(lambda, report, extSamples.length);
+  logTrainDiagnostics();
 }
 
 function logRidgeReport(
@@ -286,6 +303,47 @@ function logRidgeReport(
   }
   console.log('Bilinear: resíduo 0 no treino por construção — LOOCV real indisponível');
   console.log('Referência: o teste de precisão pós-calibração mede o erro nos 5 pontos de validação.');
+  console.groupEnd();
+}
+
+// Loga o envelope de treino e os resíduos do modelo nos 16 pontos de calibração.
+// Crítico para detectar extrapolação: se a validação receber rawX/dy fora deste
+// intervalo, o polinômio grau-2 extrapola e pode dar erros de centenas de pixels.
+function logTrainDiagnostics() {
+  if (!ridgeCoefX || !ridgeCoefY) return;
+  const W = window?.innerWidth  ?? 1920;
+  const H = window?.innerHeight ?? 1080;
+
+  console.group('[IrisFlow] Diagnóstico de treino — envelope e resíduos');
+  console.log(
+    `Envelope rawX: [${_trainMinRX.toFixed(4)}, ${_trainMaxRX.toFixed(4)}]  ` +
+    `dy: [${_trainMinDY.toFixed(4)}, ${_trainMaxDY.toFixed(4)}]`
+  );
+  console.log('Resíduos nos 16 pontos (screenX/Y previstos vs reais):');
+
+  let maxErrPx = 0;
+  for (const pt of profile) {
+    const f     = buildFeatures(pt.rawX, pt.rawY);
+    const pNX   = ridgeCoefX.reduce((s, c, i) => s + c * f[i], 0);
+    const pNY   = ridgeCoefY.reduce((s, c, i) => s + c * f[i], 0);
+    const eX    = Math.round((pNX - pt.screenX) * W);
+    const eY    = Math.round((pNY - pt.screenY) * H);
+    const ePx   = Math.round(Math.sqrt(eX ** 2 + eY ** 2));
+    maxErrPx    = Math.max(maxErrPx, ePx);
+    const outX  = (pNX < 0 || pNX > 1) ? ' ⚠EXTRAP-X' : '';
+    const outY  = (pNY < 0 || pNY > 1) ? ' ⚠EXTRAP-Y' : '';
+    console.log(
+      `  tela(${pt.screenX.toFixed(2)},${pt.screenY.toFixed(2)}) ` +
+      `raw(${pt.rawX.toFixed(4)},${pt.rawY.toFixed(4)}) ` +
+      `→ pred(${pNX.toFixed(3)},${pNY.toFixed(3)}) ` +
+      `err(${eX}px,${eY}px)=${ePx}px${outX}${outY}`
+    );
+  }
+  console.log(`Resíduo máximo no treino: ${maxErrPx}px`);
+  console.log(
+    'Se o teste de validação der erros muito maiores que este valor, ' +
+    'o input rawX/dy está fora do envelope de treino (extrapolação polinomial).'
+  );
   console.groupEnd();
 }
 
@@ -743,23 +801,48 @@ export function init() {
 
 // ── Mapeamento de Olhar (Ridge Regression) ───────────────────────────────────
 
+// Versão diagnóstica do mapGaze — expõe o valor pré-clamp e flags de extrapolação.
+// Chamada pelo accuracy.ts durante o teste de validação para logar o que o modelo vê.
+export interface GazeDiag {
+  x: number; y: number;         // resultado final em pixels (pós-clamp)
+  rawNX: number; rawNY: number; // saída do polinômio ANTES do clamp (pode ser <0 ou >1)
+  clampedX: boolean;            // se rawNX foi limitado pelo clamp de saída
+  clampedY: boolean;
+  outOfBounds: boolean;         // se (ratioX,dy) está fora do envelope de treino (+5% margem)
+}
+export function mapGazeDiag(ratioX: number, dy: number): GazeDiag | null {
+  if (!ridgeCoefX || !ridgeCoefY) return null;
+
+  const f    = buildFeatures(ratioX, dy);
+  const rawNX = ridgeCoefX.reduce((s, c, i) => s + c * f[i], 0);
+  const rawNY = ridgeCoefY.reduce((s, c, i) => s + c * f[i], 0);
+  const normX = Math.min(Math.max(rawNX, 0), 1); // clamp de SAÍDA — confirma (1)
+  const normY = Math.min(Math.max(rawNY, 0), 1);
+
+  const margin = 0.05; // 5% extra para não alertar por ruído na fronteira
+  const outOfBounds =
+    ratioX < _trainMinRX - margin || ratioX > _trainMaxRX + margin ||
+    dy     < _trainMinDY - margin || dy     > _trainMaxDY + margin;
+
+  return {
+    x: normX * window.innerWidth,
+    y: normY * window.innerHeight,
+    rawNX, rawNY,
+    clampedX: rawNX < 0 || rawNX > 1,
+    clampedY: rawNY < 0 || rawNY > 1,
+    outOfBounds,
+  };
+}
+
 // Substitui a interpolação bilinear por regressão ridge com base polinomial grau 2.
 // Vantagens sobre a bilinear:
 //   • Regularização L2 amortece o ruído de qualquer ponto de calibração individual,
 //     em vez de "gravar" o erro na malha permanentemente.
 //   • Função suave (C∞) — sem descontinuidades de gradiente nas bordas de células,
 //     eliminando o "salto" do cursor ao cruzar fronteiras de grade.
-//   • Incorpora amostras dinâmicas com pesos no ajuste global, não só nos 16 vértices.
 //   • Lambda selecionado por LOOCV shortcut — adaptativo à qualidade da calibração.
+//   • Clamp de SAÍDA aplicado: Math.min(Math.max(rawNorm, 0), 1) — confirma item (1).
 export function mapGaze(ratioX: number, dy: number): { x: number; y: number } | null {
-  if (!ridgeCoefX || !ridgeCoefY) return null;
-
-  const f    = buildFeatures(ratioX, dy);
-  const normX = Math.min(Math.max(ridgeCoefX.reduce((s, c, i) => s + c * f[i], 0), 0), 1);
-  const normY = Math.min(Math.max(ridgeCoefY.reduce((s, c, i) => s + c * f[i], 0), 0), 1);
-
-  return {
-    x: normX * window.innerWidth,
-    y: normY * window.innerHeight,
-  };
+  const d = mapGazeDiag(ratioX, dy);
+  return d ? { x: d.x, y: d.y } : null;
 }

@@ -1,4 +1,4 @@
-import { mapGaze } from './calibration';
+import { mapGazeDiag, getTrainBounds, type GazeDiag } from './calibration';
 
 export interface AccuracyResult {
   meanError: number;   // Erro médio em pixels
@@ -35,6 +35,19 @@ export function startAccuracyTest(onComplete: (result: AccuracyResult) => void) 
   let pointIndex = 0;
   const pointErrors: number[] = [];
 
+  // Loga o envelope de treino uma vez no início do teste
+  const bounds = getTrainBounds();
+  console.group('[IrisFlow] Teste de acurácia — diagnóstico de entrada');
+  console.log(
+    `Envelope de treino: rawX=[${bounds.minRX.toFixed(4)}, ${bounds.maxRX.toFixed(4)}]  ` +
+    `dy=[${bounds.minDY.toFixed(4)}, ${bounds.maxDY.toFixed(4)}]`
+  );
+  console.log(
+    'Durante cada ponto, serão logados: ponto | rawX | dy | rawNX(pré-clamp) | rawNY(pré-clamp) | ' +
+    'clamped? | outOfBounds? | → predição (px)'
+  );
+  console.groupEnd();
+
   function runNextPoint() {
     if (pointIndex >= VALIDATION_POINTS.length) {
       finishTest(overlay, pointErrors, onComplete);
@@ -44,9 +57,14 @@ export function startAccuracyTest(onComplete: (result: AccuracyResult) => void) 
     const vp = VALIDATION_POINTS[pointIndex];
     showValidationDot(overlay, vp, pointIndex);
 
-    const startTime = performance.now();
+    const startTime   = performance.now();
     const predictedX: number[] = [];
     const predictedY: number[] = [];
+
+    // Acumula raws para resumo por ponto
+    const rawsRX: number[] = [];
+    const rawsDY: number[] = [];
+    const diagFrames: GazeDiag[] = [];
 
     const targetScreenX = vp.screenX * window.innerWidth;
     const targetScreenY = vp.screenY * window.innerHeight;
@@ -54,10 +72,26 @@ export function startAccuracyTest(onComplete: (result: AccuracyResult) => void) 
     function collect() {
       const elapsed = performance.now() - startTime;
 
-      const gaze = mapGaze(rawFeedX, rawFeedY);
-      if (gaze) {
-        predictedX.push(gaze.x);
-        predictedY.push(gaze.y);
+      const diag = mapGazeDiag(rawFeedX, rawFeedY);
+      if (diag) {
+        predictedX.push(diag.x);
+        predictedY.push(diag.y);
+        rawsRX.push(rawFeedX);
+        rawsDY.push(rawFeedY);
+        diagFrames.push(diag);
+
+        // Log frame-a-frame: rawX/dy brutos + saída do modelo + flags de extrapolação
+        const clampStr  = (diag.clampedX || diag.clampedY)
+          ? ` ⚠CLAMP(${diag.clampedX ? 'X' : ''}${diag.clampedY ? 'Y' : ''})`
+          : '';
+        const boundsStr = diag.outOfBounds ? ' ⚠FORA-TREINO' : '';
+        console.log(
+          `[val pt${pointIndex + 1}/${VALIDATION_POINTS.length} ${vp.name}] ` +
+          `rawX=${rawFeedX.toFixed(4)} dy=${rawFeedY.toFixed(4)} | ` +
+          `rawNorm=(${diag.rawNX.toFixed(4)},${diag.rawNY.toFixed(4)})` +
+          `${clampStr}${boundsStr} ` +
+          `→ (${Math.round(diag.x)}px, ${Math.round(diag.y)}px)`
+        );
       }
 
       if (elapsed < COLLECTION_MS) {
@@ -70,10 +104,35 @@ export function startAccuracyTest(onComplete: (result: AccuracyResult) => void) 
       if (predictedX.length > 0) {
         const meanPX = predictedX.reduce((s, v) => s + v, 0) / predictedX.length;
         const meanPY = predictedY.reduce((s, v) => s + v, 0) / predictedY.length;
-        const dx = meanPX - targetScreenX;
+        const dx  = meanPX - targetScreenX;
         const dy2 = meanPY - targetScreenY;
         error = Math.sqrt(dx * dx + dy2 * dy2);
       }
+
+      // Resumo por ponto de validação
+      const meanRX   = rawsRX.reduce((s, v) => s + v, 0) / (rawsRX.length || 1);
+      const meanDY   = rawsDY.reduce((s, v) => s + v, 0) / (rawsDY.length || 1);
+      const nClamp   = diagFrames.filter(d => d.clampedX || d.clampedY).length;
+      const nOOB     = diagFrames.filter(d => d.outOfBounds).length;
+      const bounds2  = getTrainBounds();
+
+      console.group(
+        `[val resumo pt${pointIndex + 1}] ${vp.name} → erro=${Math.round(error)}px`
+      );
+      console.log(
+        `  rawX médio=${meanRX.toFixed(4)} (treino: [${bounds2.minRX.toFixed(4)}, ${bounds2.maxRX.toFixed(4)}]) ` +
+        `${meanRX < bounds2.minRX - 0.05 || meanRX > bounds2.maxRX + 0.05 ? '⚠ FORA' : '✓ dentro'}`
+      );
+      console.log(
+        `  dy   médio=${meanDY.toFixed(4)} (treino: [${bounds2.minDY.toFixed(4)}, ${bounds2.maxDY.toFixed(4)}]) ` +
+        `${meanDY < bounds2.minDY - 0.05 || meanDY > bounds2.maxDY + 0.05 ? '⚠ FORA' : '✓ dentro'}`
+      );
+      console.log(
+        `  Frames com clamp de saída: ${nClamp}/${diagFrames.length} | ` +
+        `Frames fora do envelope de treino: ${nOOB}/${diagFrames.length}`
+      );
+      console.log(`  Alvo: (${targetScreenX.toFixed(0)}px, ${targetScreenY.toFixed(0)}px)`);
+      console.groupEnd();
 
       pointErrors.push(error);
       pointIndex++;
