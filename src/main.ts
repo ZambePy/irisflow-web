@@ -1,6 +1,7 @@
 import './style.css';
 import { FilesetResolver, FaceLandmarker } from '@mediapipe/tasks-vision';
 import * as calibration from './calibration';
+import { feedAccuracyRaw } from './accuracy';
 
 const video = document.getElementById('webcam') as HTMLVideoElement;
 const canvas = document.getElementById('output_canvas') as HTMLCanvasElement;
@@ -15,6 +16,28 @@ let targetX = window.innerWidth / 2;
 let targetY = window.innerHeight / 2;
 let currentX = window.innerWidth / 2;
 let currentY = window.innerHeight / 2;
+
+// Rolling buffer de 6 frames para suavização ponderada (inspirado no EyeGestures engine)
+// Reduz jitter especialmente nas bordas da tela onde o sinal é mais ruidoso
+const BUFFER_SIZE = 6;
+const bufferX: number[] = [];
+const bufferY: number[] = [];
+// Pesos crescentes: frames mais recentes têm maior influência
+const BUFFER_WEIGHTS = [1, 2, 3, 4, 5, 6];
+
+function weightedBufferAvg(buf: number[]): number {
+  const len = buf.length;
+  if (len === 0) return 0;
+  let weightSum = 0;
+  let valueSum = 0;
+  for (let i = 0; i < len; i++) {
+    // Alinha os pesos pelo final do buffer (mais recente = maior peso)
+    const w = BUFFER_WEIGHTS[BUFFER_SIZE - len + i];
+    valueSum += buf[i] * w;
+    weightSum += w;
+  }
+  return valueSum / weightSum;
+}
 
 // Limites padrão para calibração auto-adaptativa
 const DEFAULT_MIN_X = 0.35;
@@ -144,6 +167,9 @@ async function predictWebcam() {
       // Envia coordenadas cruas para o sistema de calibração (registra se estiver capturando)
       calibration.feedRawData(ratioX, dy);
 
+      // Alimenta o módulo de precisão com as coordenadas cruas
+      feedAccuracyRaw(ratioX, dy);
+
       // Tenta mapear o olhar usando o perfil calibrado
       const calibratedGaze = calibration.mapGaze(ratioX, dy);
 
@@ -159,6 +185,16 @@ async function predictWebcam() {
         targetX = clamp(mappedX, 0, window.innerWidth);
         targetY = clamp(mappedY, 0, window.innerHeight);
       }
+
+      // Atualiza o rolling buffer com o target calculado
+      bufferX.push(targetX);
+      bufferY.push(targetY);
+      if (bufferX.length > BUFFER_SIZE) bufferX.shift();
+      if (bufferY.length > BUFFER_SIZE) bufferY.shift();
+
+      // Substitui targetX/Y pela média ponderada do buffer antes do LERP
+      targetX = weightedBufferAvg(bufferX);
+      targetY = weightedBufferAvg(bufferY);
     }
   }
 
