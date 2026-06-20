@@ -236,6 +236,13 @@ body {
   pointer-events: none;
 }
 
+/* Instrução sobe para o topo durante fase dinâmica */
+.calibration-overlay.dynamic-phase .calibration-instruction {
+  top: 5%;
+  transform: translateX(-50%);
+  font-size: 1.0rem;
+}
+
 .calibration-instruction .highlight {
   color: #00fff0;
   font-weight: 600;
@@ -270,13 +277,58 @@ body {
   background: radial-gradient(circle, #ffffff 20%, #00fff0 70%);
   transform: translate(-50%, -50%);
   cursor: pointer;
-  box-shadow: 
+  box-shadow:
     0 0 15px #00fff0,
     0 0 30px rgba(0, 255, 240, 0.5);
   display: flex;
   justify-content: center;
   align-items: center;
   transition: transform 0.2s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+  animation: dotAppear 0.25s ease-out;
+}
+
+@keyframes dotAppear {
+  from { opacity: 0; transform: translate(-50%, -50%) scale(0.4); }
+  to   { opacity: 1; transform: translate(-50%, -50%) scale(1.0); }
+}
+
+/* Anel de contagem regressiva SVG */
+.countdown-ring {
+  position: absolute;
+  width: 60px;
+  height: 60px;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%) rotate(-90deg);
+  pointer-events: none;
+  overflow: visible;
+}
+
+.ring-track {
+  fill: none;
+  stroke: rgba(255, 255, 255, 0.12);
+  stroke-width: 3;
+  stroke-dasharray: 150.8;
+  stroke-dashoffset: 0;
+}
+
+.ring-fill {
+  fill: none;
+  stroke: rgba(0, 255, 240, 0.5);
+  stroke-width: 3;
+  stroke-linecap: round;
+  stroke-dasharray: 150.8;
+  stroke-dashoffset: 150.8;
+}
+
+.calibration-dot.capturing .ring-fill {
+  animation: ring-countdown 1s linear forwards;
+  stroke: rgba(255, 0, 85, 0.9);
+}
+
+@keyframes ring-countdown {
+  from { stroke-dashoffset: 150.8; }
+  to   { stroke-dashoffset: 0; }
 }
 
 .dot-inner {
@@ -303,13 +355,29 @@ body {
 
 .calibration-dot.capturing {
   background: radial-gradient(circle, #ffffff 20%, #ff0055 70%);
-  box-shadow: 
+  box-shadow:
     0 0 25px #ff0055,
     0 0 50px rgba(255, 0, 85, 0.6);
 }
 
 .calibration-dot.capturing .dot-pulse {
   border-color: rgba(255, 0, 85, 0.6);
+}
+
+/* Estado pós-captura: flash verde antes de mudar de ponto */
+.calibration-dot.captured {
+  background: radial-gradient(circle, #ffffff 20%, #00ff78 70%);
+  box-shadow:
+    0 0 25px #00ff78,
+    0 0 50px rgba(0, 255, 120, 0.7);
+  animation: capturedFade 1s ease-out forwards;
+  pointer-events: none;
+}
+
+@keyframes capturedFade {
+  0%   { transform: translate(-50%, -50%) scale(1.4); opacity: 1; }
+  40%  { transform: translate(-50%, -50%) scale(1.0); opacity: 1; }
+  100% { transform: translate(-50%, -50%) scale(0.3); opacity: 0; }
 }
 
 /* Estado de ponto instável (movimento detectado durante captura) */
@@ -438,4 +506,89 @@ body {
   background: rgba(255, 60, 60, 0.1);
   color: #ff3c3c;
   border-color: rgba(255, 60, 60, 0.3);
+}
+
+/* ── Badge de fase e subtítulo ─────────────────────────────────────────────── */
+
+.phase-badge {
+  display: inline-block;
+  padding: 3px 12px;
+  border-radius: 20px;
+  background: rgba(0, 255, 240, 0.1);
+  border: 1px solid rgba(0, 255, 240, 0.35);
+  color: #00fff0;
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1.5px;
+  margin-bottom: 6px;
+}
+
+.phase-sub {
+  font-size: 1rem;
+  color: rgba(255, 255, 255, 0.6);
+  margin-top: 8px;
+  font-weight: 400;
+}
+
+/* ── Bolinha dinâmica ──────────────────────────────────────────────────────── */
+
+.dynamic-ball {
+  position: fixed;
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 35% 35%, #ffffff, #00fff0 50%, #0077ff);
+  box-shadow:
+    0 0 0 5px rgba(0, 255, 240, 0.15),
+    0 0 20px rgba(0, 255, 240, 0.75),
+    0 0 50px rgba(0, 120, 255, 0.4);
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  z-index: 1002;
+  will-change: left, top;
+}
+
+.dynamic-ball.pulsing {
+  animation: ball-pulse 1.5s ease-in-out;
+}
+
+@keyframes ball-pulse {
+  0%   { transform: translate(-50%, -50%) scale(1.0);  box-shadow: 0 0 0 5px rgba(0,255,240,0.15), 0 0 20px rgba(0,255,240,0.75), 0 0 50px rgba(0,120,255,0.4); }
+  25%  { transform: translate(-50%, -50%) scale(0.28); box-shadow: 0 0 0 14px rgba(0,255,240,0.08), 0 0 40px rgba(0,255,240,0.9), 0 0 80px rgba(0,120,255,0.6); }
+  65%  { transform: translate(-50%, -50%) scale(0.28); box-shadow: 0 0 0 14px rgba(0,255,240,0.08), 0 0 40px rgba(0,255,240,0.9), 0 0 80px rgba(0,120,255,0.6); }
+  100% { transform: translate(-50%, -50%) scale(1.0);  box-shadow: 0 0 0 5px rgba(0,255,240,0.15), 0 0 20px rgba(0,255,240,0.75), 0 0 50px rgba(0,120,255,0.4); }
+}
+
+/* ── Progresso da fase dinâmica ────────────────────────────────────────────── */
+
+.dynamic-progress {
+  position: absolute;
+  bottom: 80px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  pointer-events: none;
+}
+
+.progress-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.12);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  transition: all 0.35s ease;
+}
+
+.progress-dot.active {
+  background: #00fff0;
+  box-shadow: 0 0 8px rgba(0, 255, 240, 0.7), 0 0 18px rgba(0, 255, 240, 0.3);
+  transform: scale(1.5);
+}
+
+.progress-dot.done {
+  background: rgba(0, 255, 240, 0.3);
+  border-color: rgba(0, 255, 240, 0.4);
 }
